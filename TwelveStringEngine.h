@@ -9,17 +9,20 @@
 //     never perfectly in tune, giving the famous shimmering chorus.
 //
 // This engine rebuilds those partner strings from the 6-string signal:
-//   Octave voice : low-passed input -> pitch shifter (+12 st) ->
-//                  thin/bright EQ.  Two decorrelated copies (L/R).
-//   Unison voice : full-band input -> two slightly detuned pitch shifters
-//                  (+cents / -cents), panned apart.
-//   Strum offset : short pre-delay on the partner strings.
+//   Octave voice : lower register (set by Range) -> +12 st pitch shifter ->
+//                  thin/bright EQ. Two decorrelated copies (L/R).
+//   Unison voice : upper register only -> two slightly detuned shifters
+//                  (+cents / -cents), panned apart. Bass notes get no twin,
+//                  just as the low courses of a real 12-string have none.
+//   Strum        : the octave string is picked this many ms BEFORE the main
+//                  string (the octave string sits on top of each course).
 //   Drift        : slow random pitch wander so the pairs never lock.
-//   HQ mode      : octave made with a phase vocoder (clean on chords); the dry
-//                  signal is delayed to line up and the delay is reported to
-//                  the host for automatic latency compensation.
-//   Live mode    : octave made with a zero-latency grain shifter instead, for
-//                  monitoring while recording (rougher on low notes).
+//   HQ mode      : all partner strings made with phase vocoders that keep the
+//                  pick attack sharp; the dry signal is delayed so the octave
+//                  can lead it, and the delay is reported to the host for
+//                  automatic latency compensation.
+//   Live mode    : zero-latency grain shifters instead, for monitoring while
+//                  recording (rougher; partner strings follow the main one).
 //
 // Pure C++17, no framework dependencies, so it can be unit-tested on its own.
 // ---------------------------------------------------------------------------
@@ -45,7 +48,7 @@ struct Params
     float sparkleDb      = 6.f;     // -6..+12 brightness of the octave strings
     float unisonMix      = 0.40f;   // 0..1   level of the unison twins
     float detuneCents    = 6.f;     // 0..25  how far out of tune the twins are
-    float strumMs        = 4.f;     // 0..20  pick offset of the partner strings
+    float strumMs        = 4.f;     // 0..20  how early the octave string is picked
     float drift          = 0.35f;   // 0..1   random wander of the pairs
     float width          = 0.70f;   // 0..1   stereo spread
     float dryLevel       = 1.0f;    // 0..1   original guitar level
@@ -312,8 +315,13 @@ private:
 };
 
 //==============================================================================
-// Streaming phase-vocoder pitch shifter (Bernsee-style, 8x overlap).
-// Clean on full chords; latency = fftSize - hop samples.
+// Streaming phase-vocoder pitch shifter (8x overlap) with two additions that
+// keep a plucked attack sharp:
+//   * phase reset on attack frames, so the shifted partials line up again the
+//     way they do in a real pick attack (no "washy" smeared start);
+//   * a transient gate that stops the shifter from sounding before the note
+//     it is shifting (the pre-echo that FFT processing otherwise leaks).
+// Output delay = fftSize samples (one frame of input buffering + one hop of output).
 class PhaseVocoderShifter
 {
 public:
@@ -333,10 +341,17 @@ public:
         for (auto* v : { &inFifo, &outFifo, &outAccum })
             v->assign ((size_t) N * 2, 0.f);
         frame.assign ((size_t) N, {});
-        for (auto* v : { &lastPhase, &sumPhase, &anaMag, &anaFreq, &synMag, &synFreq })
+        for (auto* v : { &lastPhase, &sumPhase, &anaMag, &anaFreq, &anaPhase, &synMag, &synFreq, &synAnaPhase })
             v->assign ((size_t) N / 2 + 1, 0.0);
 
         gain = float (1.0 / (double (N) * 0.375 * osamp));
+
+        // transient gate: envelope followers (instant attack, 40 ms release)
+        envRing.assign ((size_t) N, 0.f);   // aligned with the true output delay
+        envRelease  = float (std::exp (-1.0 / (0.040 * sampleRate)));
+        gateSmooth  = float (1.0 - std::exp (-1.0 / (0.0007 * sampleRate)));
+        ratioSmooth = float (1.0 - std::exp (-1.0 / (0.5 * sampleRate)));
+        energyFloor = 1.0e-7 * double (N);
         reset();
     }
 
@@ -344,7 +359,10 @@ public:
     {
         for (auto* v : { &inFifo, &outFifo, &outAccum }) std::fill (v->begin(), v->end(), 0.f);
         for (auto* v : { &lastPhase, &sumPhase }) std::fill (v->begin(), v->end(), 0.0);
-        rover = latency;
+        std::fill (envRing.begin(), envRing.end(), 0.f);
+        rover = latency; envW = 0;
+        inEnv = outEnv = 0.f; gateGain = 1.f; logRatio = 0.f;
+        prevEnergy = 0.0; framesSinceReset = 100;
     }
 
     void setRatio (double r) noexcept
@@ -353,21 +371,48 @@ public:
         // shifting up spreads each partial over fewer bins; restore its level
         postGain = r > 1.0 ? float (std::pow (r, 0.7)) : 1.f;
     }
-    int getLatency() const noexcept     { return latency; }
+    void setTransientHandling (bool on) noexcept { transients = on; }
+    int getLatency() const noexcept     { return N; }   // measured: output lags input by exactly N
 
     inline float process (float x) noexcept
     {
         inFifo[(size_t) rover] = x;
-        const float y = outFifo[(size_t) (rover - latency)];
+
+        // input envelope, delayed by the latency so it lines up with the output
+        const float ax = std::abs (x);
+        inEnv = ax > inEnv ? ax : inEnv * envRelease;
+        const float alignedIn = envRing[(size_t) envW];
+        envRing[(size_t) envW] = inEnv;
+        if (++envW >= N) envW = 0;
+
+        float y = outFifo[(size_t) (rover - latency)];
         if (++rover >= N)
         {
             rover = latency;
             processFrame();
         }
+
+        if (transients)
+        {
+            // Envelope matching: the shifted string follows the volume shape of what was
+            // actually played at that moment. Kills pre-echo before the pick and restores
+            // the sharp attack that FFT processing smears out.
+            const float ay = std::abs (y);
+            outEnv = ay > outEnv ? ay : outEnv * envRelease;
+            if (alignedIn > 1.0e-4f && outEnv > 1.0e-4f)
+                logRatio += ratioSmooth * (std::log (outEnv / alignedIn) - logRatio);
+            const float target = outEnv > 1.0e-6f
+                               ? std::clamp (std::exp (logRatio) * alignedIn / outEnv, 0.f, kMaxAttackBoost)
+                               : 1.f;
+            gateGain += gateSmooth * (target - gateGain);
+            y *= gateGain;
+        }
         return y;
     }
 
 private:
+    static constexpr float kMaxAttackBoost = 4.0f;   // up to +12 dB while the attack builds
+
     static inline double wrap (double ph) noexcept
     {
         return ph - kTwoPi * std::floor ((ph + kTwoPi * 0.5) / kTwoPi);
@@ -383,6 +428,7 @@ private:
         fft.perform (frame.data(), false);
 
         // ---- analysis: true frequency of every bin ----
+        double energy = 0.0;
         for (int k = 0; k <= half; ++k)
         {
             const auto c = frame[(size_t) k];
@@ -391,9 +437,18 @@ private:
             double d = ph - lastPhase[(size_t) k];
             lastPhase[(size_t) k] = ph;
             d = wrap (d - k * expct);
-            anaFreq[(size_t) k] = k + d * osamp / kTwoPi;
-            anaMag[(size_t) k] = mag;
+            anaFreq[(size_t) k]  = k + d * osamp / kTwoPi;
+            anaMag[(size_t) k]   = mag;
+            anaPhase[(size_t) k] = ph;
+            energy += mag * mag;
         }
+
+        // ---- attack detection: a sudden rise in frame energy (> +4 dB) ----
+        bool attack = false;
+        if (transients && energy > energyFloor && energy > 2.5 * prevEnergy && framesSinceReset > 2)
+            attack = true;
+        prevEnergy = energy;
+        framesSinceReset = attack ? 0 : framesSinceReset + 1;
 
         // ---- shift ----
         std::fill (synMag.begin(), synMag.end(), 0.0);
@@ -402,15 +457,24 @@ private:
         {
             const int idx = (int) std::lround (k * ratio);
             if (idx > half) break;
+            if (anaMag[(size_t) k] >= synMag[(size_t) idx])        // strongest source wins the phase
+            {
+                synFreq[(size_t) idx] = anaFreq[(size_t) k] * ratio;
+                synAnaPhase[(size_t) idx] = anaPhase[(size_t) k];
+            }
             synMag[(size_t) idx] += anaMag[(size_t) k];
-            synFreq[(size_t) idx] = anaFreq[(size_t) k] * ratio;
         }
 
         // ---- synthesis ----
         for (int k = 0; k <= half; ++k)
         {
-            const double d = kTwoPi * (synFreq[(size_t) k] - k) / osamp + k * expct;
-            sumPhase[(size_t) k] = wrap (sumPhase[(size_t) k] + d);
+            if (attack)
+                sumPhase[(size_t) k] = wrap (ratio * synAnaPhase[(size_t) k]);   // re-align partials
+            else
+            {
+                const double d = kTwoPi * (synFreq[(size_t) k] - k) / osamp + k * expct;
+                sumPhase[(size_t) k] = wrap (sumPhase[(size_t) k] + d);
+            }
             frame[(size_t) k] = std::polar (float (synMag[(size_t) k]), float (sumPhase[(size_t) k]));
         }
         for (int k = half + 1; k < N; ++k)
@@ -429,9 +493,17 @@ private:
     int N = 2048, osamp = 8, hop = 256, latency = 1792, rover = 0;
     double ratio = 2.0;
     float gain = 1.f, postGain = 1.f;
+    bool transients = true;
     std::vector<float> win, inFifo, outFifo, outAccum;
     std::vector<std::complex<float>> frame;
-    std::vector<double> lastPhase, sumPhase, anaMag, anaFreq, synMag, synFreq;
+    std::vector<double> lastPhase, sumPhase, anaMag, anaFreq, anaPhase, synMag, synFreq, synAnaPhase;
+
+    std::vector<float> envRing;
+    int envW = 0;
+    float inEnv = 0, outEnv = 0, gateGain = 1, envRelease = 0.999f, gateSmooth = 0.03f;
+    float logRatio = 0, ratioSmooth = 1.0e-4f;
+    double prevEnergy = 0, energyFloor = 0;
+    int framesSinceReset = 100;
 };
 
 //==============================================================================
@@ -440,35 +512,39 @@ class TwelveStringEngine
 public:
     static constexpr double kLiveOctWinMsL = 26.0, kLiveOctWinMsR = 30.0;
     static constexpr double kUnisonWinMsL  = 44.0, kUnisonWinMsR  = 50.0;
-    static constexpr double kMaxStrumMs    = 25.0;
+    static constexpr double kMaxStrumMs    = 20.0;
+    static constexpr double kTailMs        = 16.0;   // room for the unison pick offsets
 
     void prepare (double sampleRate)
     {
         sr = sampleRate;
+        const double ms = 0.001 * sr;
 
-        pvL.prepare (sr);
-        pvR.prepare (sr);
-        pvLatency = pvL.getLatency();
-        const double pvLatencyMs = 1000.0 * pvLatency / sr;
+        for (auto* pv : { &pvOctL, &pvOctR, &pvUniL, &pvUniR })
+            pv->prepare (sr);
+        pvLatency = pvOctL.getLatency();
+        leadSamples = int (std::ceil (kMaxStrumMs * ms)) + 4;
+        hqLatency = pvLatency + leadSamples;
 
-        liveL.prepare (sr, kLiveOctWinMsL, kMaxStrumMs + 5.0, 2);
-        liveR.prepare (sr, kLiveOctWinMsR, kMaxStrumMs + 5.0, 2);
-        uniL.prepare (sr, kUnisonWinMsL, pvLatencyMs + kMaxStrumMs + 5.0, 2);
-        uniR.prepare (sr, kUnisonWinMsR, pvLatencyMs + kMaxStrumMs + 5.0, 2);
+        liveOctL.prepare (sr, kLiveOctWinMsL, kMaxStrumMs + 5.0, 2);
+        liveOctR.prepare (sr, kLiveOctWinMsR, kMaxStrumMs + 5.0, 2);
+        liveUniL.prepare (sr, kUnisonWinMsL, kMaxStrumMs + 5.0, 2);
+        liveUniR.prepare (sr, kUnisonWinMsR, kMaxStrumMs + 5.0, 2);
 
-        strumL.prepare (int ((kMaxStrumMs + 5.0) * 0.001 * sr));
-        strumR.prepare (int ((kMaxStrumMs + 5.0) * 0.001 * sr));
-        dryL.prepare (pvLatency + 16);
-        dryR.prepare (pvLatency + 16);
+        const int lineLen = leadSamples + int (kTailMs * ms) + 16;
+        for (auto* d : { &octLineL, &octLineR, &uniLineL, &uniLineR })
+            d->prepare (lineLen);
+        dryL.prepare (hqLatency + 16);
+        dryR.prepare (hqLatency + 16);
 
         driftOL.prepare (sr, 0x1234567u, 0.9);
         driftOR.prepare (sr, 0x7654321u, 1.1);
         driftUL.prepare (sr, 0x0badf00u, 0.6);
         driftUR.prepare (sr, 0x0c0ffeeu, 0.7);
 
-        inHpf.setHighpass (sr, 70.0, 0.707);
-        octHpfL.setHighpass (sr, 160.0, 0.707);
-        octHpfR.setHighpass (sr, 160.0, 0.707);
+        inHpf.setHighpass (sr, 60.0, 0.707);
+        octHpfL.setHighpass (sr, 120.0, 0.707);
+        octHpfR.setHighpass (sr, 120.0, 0.707);
 
         const float c = float (1.0 - std::exp (-1.0 / (0.02 * sr)));   // ~20 ms smoothing
         for (auto* s : { &gOct, &gUni, &gDry, &gOut, &gWidth, &gStrum })
@@ -481,9 +557,10 @@ public:
 
     void reset()
     {
-        pvL.reset(); pvR.reset(); liveL.reset(); liveR.reset(); uniL.reset(); uniR.reset();
-        strumL.reset(); strumR.reset(); dryL.reset(); dryR.reset();
-        for (auto* f : { &inHpf, &focus1, &focus2, &octHpfL, &octHpfR, &shelfL, &shelfR })
+        for (auto* pv : { &pvOctL, &pvOctR, &pvUniL, &pvUniR }) pv->reset();
+        for (auto* g : { &liveOctL, &liveOctR, &liveUniL, &liveUniR }) g->reset();
+        for (auto* d : { &octLineL, &octLineR, &uniLineL, &uniLineR, &dryL, &dryR }) d->reset();
+        for (auto* f : { &inHpf, &focus1, &focus2, &uniHp1, &uniHp2, &octHpfL, &octHpfR, &shelfL, &shelfR })
             f->reset();
         gOct.reset (p.octaveMix);
         gUni.reset (p.unisonMix);
@@ -509,7 +586,7 @@ public:
     }
 
     // Latency the host should compensate for (0 in Live mode).
-    int getLatencySamples() const noexcept { return p.liveMode ? 0 : pvLatency; }
+    int getLatencySamples() const noexcept { return p.liveMode ? 0 : hqLatency; }
 
     // In-place safe. inR may equal inL for mono input.
     void process (const float* inL, const float* inR, float* outL, float* outR, int n) noexcept
@@ -517,69 +594,76 @@ public:
         if (p.liveMode != activeLive)        // mode switch: clear the voices that change timing
         {
             activeLive = p.liveMode;
-            pvL.reset(); pvR.reset(); liveL.reset(); liveR.reset();
-            uniL.reset(); uniR.reset(); dryL.reset(); dryR.reset(); strumL.reset(); strumR.reset();
+            for (auto* pv : { &pvOctL, &pvOctR, &pvUniL, &pvUniR }) pv->reset();
+            for (auto* g : { &liveOctL, &liveOctR, &liveUniL, &liveUniR }) g->reset();
+            for (auto* d : { &octLineL, &octLineR, &uniLineL, &uniLineR, &dryL, &dryR }) d->reset();
         }
 
         const bool live = activeLive;
-        const int dryDelay = live ? 0 : pvLatency;
+        const double ms = 0.001 * sr;
         const double octDriftCents = 4.0 * p.drift;
         const double uniDriftCents = p.drift * (1.5 + 0.35 * p.detuneCents);
-        // in HQ mode the unison voices are pushed back so they line up with the delayed dry
-        const double uniAlignL = live ? 0.0 : std::max (0.0, pvLatency - 0.5 * uniL.windowSamples());
-        const double uniAlignR = live ? 0.0 : std::max (0.0, pvLatency - 0.5 * uniR.windowSamples());
-        const double ms = 0.001 * sr;
 
         for (int i = 0; i < n; ++i)
         {
             const float xl = inL[i], xr = inR[i];
             const float mono = inHpf.process (0.5f * (xl + xr));
-            const float strum = gStrum.next();
+            const double strum = gStrum.next();
 
-            // ---- octave strings: only the lower register gets an octave partner ----
+            // Courses: octave partners for the low/mid register, unison twins for the top.
+            const float octIn = focus2.process (focus1.process (mono));
+            const float uniIn = uniHp2.process (uniHp1.process (mono));
+
             const double rOL = 2.0 * centsToRatio (octDriftCents * driftOL.process() + 1.5);
             const double rOR = 2.0 * centsToRatio (octDriftCents * driftOR.process() - 1.5);
-            const float focused = focus2.process (focus1.process (mono));
-            float rawL, rawR;
+            const double rUL = centsToRatio ( p.detuneCents + uniDriftCents * driftUL.process());
+            const double rUR = centsToRatio (-p.detuneCents + uniDriftCents * driftUR.process());
+
+            float rawOL, rawOR, uL, uR, dl, dr;
 
             if (live)
             {
-                liveL.setRatio (rOL);  liveL.setBaseDelay (strum);
-                liveR.setRatio (rOR);  liveR.setBaseDelay (strum + 0.7 * ms);
-                rawL = liveL.process (focused);
-                rawR = liveR.process (focused);
+                // zero latency: partner strings can only follow the main string
+                liveOctL.setRatio (rOL);  liveOctL.setBaseDelay (strum);
+                liveOctR.setRatio (rOR);  liveOctR.setBaseDelay (strum + 0.7 * ms);
+                liveUniL.setRatio (rUL);  liveUniL.setBaseDelay (0.5 * strum + 1.0 * ms);
+                liveUniR.setRatio (rUR);  liveUniR.setBaseDelay (0.5 * strum + 1.8 * ms);
+                rawOL = liveOctL.process (octIn);
+                rawOR = liveOctR.process (octIn);
+                uL = liveUniL.process (uniIn);
+                uR = liveUniR.process (uniIn);
+                dl = xl; dr = xr;
             }
             else
             {
-                pvL.setRatio (rOL);
-                pvR.setRatio (rOR);
-                strumL.write (pvL.process (focused));
-                strumR.write (pvR.process (focused));
-                rawL = strumL.read (std::max (2.0, double (strum)));
-                rawR = strumR.read (std::max (2.0, strum + 0.7 * ms));
+                // HQ: the main string is held back by `leadSamples`, so the octave
+                // string can be picked *before* it, as on a real 12-string downstroke.
+                pvOctL.setRatio (rOL); pvOctR.setRatio (rOR);
+                pvUniL.setRatio (rUL); pvUniR.setRatio (rUR);
+                octLineL.write (pvOctL.process (octIn));
+                octLineR.write (pvOctR.process (octIn));
+                uniLineL.write (pvUniL.process (uniIn));
+                uniLineR.write (pvUniR.process (uniIn));
+
+                const double lead = leadSamples;
+                rawOL = octLineL.read (std::max (2.0, lead - strum));
+                rawOR = octLineR.read (std::max (2.0, lead - strum + 0.7 * ms));
+                uL = uniLineL.read (lead + 0.3 * strum + 1.0 * ms);
+                uR = uniLineR.read (lead + 0.3 * strum + 1.8 * ms);
+
+                dryL.write (xl);
+                dryR.write (xr);
+                dl = dryL.readInt (hqLatency);
+                dr = dryR.readInt (hqLatency);
             }
 
-            const float oL = shelfL.process (octHpfL.process (rawL));
-            const float oR = shelfR.process (octHpfR.process (rawR));
-
-            // ---- unison twins ----
-            uniL.setRatio (centsToRatio ( p.detuneCents + uniDriftCents * driftUL.process()));
-            uniR.setRatio (centsToRatio (-p.detuneCents + uniDriftCents * driftUR.process()));
-            uniL.setBaseDelay (uniAlignL + 0.5 * strum + 1.0 * ms);
-            uniR.setBaseDelay (uniAlignR + 0.5 * strum + 1.8 * ms);
-            const float uL = uniL.process (mono);
-            const float uR = uniR.process (mono);
-
-            // ---- dry (delayed in HQ mode to line up) ----
-            dryL.write (xl);
-            dryR.write (xr);
-            const float dl = dryDelay ? dryL.readInt (dryDelay) : xl;
-            const float dr = dryDelay ? dryR.readInt (dryDelay) : xr;
+            const float oL = shelfL.process (octHpfL.process (rawOL));
+            const float oR = shelfR.process (octHpfR.process (rawOR));
 
             // ---- mix ----
             const float w  = gWidth.next();
             const float go = gOct.next() * kOctaveMakeup;
-            const float gu = gUni.next() * 0.7f;
+            const float gu = gUni.next() * kUnisonMakeup;
             const float gd = gDry.next();
             const float g  = gOut.next();
 
@@ -594,6 +678,7 @@ public:
 
 private:
     static constexpr float kOctaveMakeup = 1.6f;   // compensates for focus-filter loss
+    static constexpr float kUnisonMakeup = 0.85f;  // twins now cover only the upper register
 
     static inline double centsToRatio (double c) noexcept { return std::pow (2.0, c / 1200.0); }
     static inline float dbToGain (float db) noexcept      { return std::pow (10.f, db / 20.f); }
@@ -610,6 +695,10 @@ private:
     {
         focus1.setLowpass (sr, p.octaveFocusHz, 0.54);   // 4th-order Butterworth pair
         focus2.setLowpass (sr, p.octaveFocusHz, 1.31);
+        // twins start where the bass strings end: about a third of the octave range
+        const double uniHz = std::clamp (double (p.octaveFocusHz) / 3.0, 150.0, 1500.0);
+        uniHp1.setHighpass (sr, uniHz, 0.54);
+        uniHp2.setHighpass (sr, uniHz, 1.31);
         shelfL.setHighShelf (sr, 2800.0, p.sparkleDb);
         shelfR.setHighShelf (sr, 2800.0, p.sparkleDb);
     }
@@ -618,12 +707,12 @@ private:
     bool prepared = false, activeLive = false;
     Params p;
 
-    PhaseVocoderShifter pvL, pvR;
-    GrainShifter liveL, liveR, uniL, uniR;
+    PhaseVocoderShifter pvOctL, pvOctR, pvUniL, pvUniR;
+    GrainShifter liveOctL, liveOctR, liveUniL, liveUniR;
     Drift driftOL, driftOR, driftUL, driftUR;
-    Biquad inHpf, focus1, focus2, octHpfL, octHpfR, shelfL, shelfR;
-    DelayBuffer strumL, strumR, dryL, dryR;
-    int pvLatency = 0;
+    Biquad inHpf, focus1, focus2, uniHp1, uniHp2, octHpfL, octHpfR, shelfL, shelfR;
+    DelayBuffer octLineL, octLineR, uniLineL, uniLineR, dryL, dryR;
+    int pvLatency = 0, leadSamples = 0, hqLatency = 0;
 
     Smoothed gOct, gUni, gDry, gOut, gWidth, gStrum;
 };

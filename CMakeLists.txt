@@ -1,11 +1,14 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(TwelveStringer VERSION 1.0.0 LANGUAGES C CXX)
+project(TwelveStringer VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
 
+# --- JUCE --------------------------------------------------------------------
+# Uses a local JUCE checkout if you pass -DJUCE_PATH=/path/to/JUCE,
+# otherwise downloads JUCE 8.0.9 automatically.
 if(DEFINED JUCE_PATH)
     add_subdirectory(${JUCE_PATH} JUCE)
 else()
@@ -17,8 +20,9 @@ else()
     FetchContent_MakeAvailable(JUCE)
 endif()
 
+# --- Plugin ------------------------------------------------------------------
 juce_add_plugin(TwelveStringer
-    COMPANY_NAME                "TwelveStringer"
+    COMPANY_NAME                "Peter Eardley"
     PRODUCT_NAME                "TwelveStringer"
     PLUGIN_MANUFACTURER_CODE    Twsg
     PLUGIN_CODE                 T12s
@@ -47,7 +51,6 @@ target_compile_definitions(TwelveStringer PUBLIC
 
 target_link_libraries(TwelveStringer
     PRIVATE
-        juce::juce_audio_processors
         juce::juce_audio_utils
     PUBLIC
         juce::juce_recommended_config_flags

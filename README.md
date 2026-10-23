@@ -1,5 +1,7 @@
 # TwelveStringer
 
+*Made by Peter Eardley*
+
 A VST3 / AU effect that makes a 6-string guitar sound like a 12-string. Works in FL Studio (Windows and Mac) and any other VST3/AU host.
 
 ## How it works
@@ -8,25 +10,25 @@ A real 12-string has six *courses* of paired strings. The four low courses (E A 
 
 | Section | What it adds |
 |---|---|
-| **Octave strings** | A phase-vocoder pitch shifter adds a +12-semitone copy of the low/mid register, thinned and brightened like a light-gauge octave string. |
-| **Unison strings** | Two slightly detuned copies (one sharp, one flat), panned apart, for the shimmering chorus of the paired high strings. |
-| **Feel** | A short pick-timing offset, slow random drift so the pairs never lock together, and stereo width. |
+| **Octave strings** | A +12-semitone copy of the low/mid register, thinned and brightened like a light-gauge octave string, picked a few ms *before* the main string as on a real downstroke. |
+| **Unison strings** | Two slightly detuned copies (one sharp, one flat) of the upper register only, panned apart, for the shimmer of the paired high B and E strings. Bass notes get no twin, as on a real 12-string. |
+| **Feel** | Slow random drift so the pairs never lock together, and stereo width. |
 
 ## Controls
 
 | Knob | Range | What it does |
 |---|---|---|
 | Octave · Mix | 0–100 % | Level of the octave strings. |
-| Octave · Range | 300 Hz–8 kHz | How far up the neck octaves are added. Lower = octaves only on the bass strings (more authentic); higher = octaves on everything (brighter, more "jangle"). |
+| Octave · Range | 300 Hz–8 kHz | How far up the neck octaves are added. Lower = octaves only on the bass strings (more authentic); higher = octaves on everything (brighter, more "jangle"). The twin strings take over above roughly a third of this setting. |
 | Octave · Sparkle | −6 to +12 dB | Brightness of the octave strings. |
 | Unison · Mix | 0–100 % | Level of the detuned unison twins. |
 | Unison · Detune | 0–25 cents | How far out of tune the twins are. 4–8 is realistic; above 12 gets seasick. |
 | Unison · Drift | 0–100 % | Slow random tuning wander, like a real 12-string going slightly out. |
-| Strum | 0–20 ms | How late the partner strings are picked relative to the main string. |
+| Strum | 0–20 ms | How early the octave string is picked before the main string (in Live mode it can only follow it). |
 | Width | 0–100 % | Stereo spread of the partner strings. |
 | Dry | 0–100 % | Level of your original guitar. Turn it down to hear only the added strings. |
 | Output | −24 to +12 dB | Overall level. |
-| **LIVE** | on / off | **Off (HQ)**: cleanest octave; adds ~40 ms of latency that is reported to FL Studio so it is compensated automatically. **On (Live)**: zero latency for monitoring while you record, with a rougher octave on low notes. Track with LIVE on, mix with it off. |
+| **LIVE** | on / off | **Off (HQ)**: cleanest sound with sharp pick attacks; adds about 65 ms of latency that is reported to FL Studio so it is compensated automatically. **On (Live)**: zero latency for monitoring while you record, with a rougher octave on low notes. Track with LIVE on, mix with it off. |
 
 Presets: Classic 12-String, Jangle Pop, Folk Strummer, Subtle Doubler, Wide Shimmer, Octaves Only.
 
@@ -73,6 +75,18 @@ On a Mac, if FL Studio refuses to load a plugin downloaded from GitHub, run this
 xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/TwelveStringer.vst3
 ```
 
+## Version history
+
+**1.1**
+- Twin (unison) strings now only on the upper register, so bass notes no longer get a chorus wobble.
+- Octave string is picked before the main string, as on a real 12-string downstroke.
+- Sharp pick attack on the added strings: no faint pre-echo before the note, attack rise about 3 ms (was about 22 ms).
+- Twin strings no longer swell in volume on long held notes.
+- Fixed: the added strings arrived about 5 ms later than intended in 1.0.
+- "Made by Peter Eardley" credit; knob tooltips.
+
+**1.0** — first release.
+
 ## Tips
 
 - Feed it a clean or lightly compressed guitar; put distortion *after* it.
@@ -82,11 +96,9 @@ xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/TwelveStringer.vst3
 ## Project layout
 
 ```
-Source/TwelveStringEngine.h   all of the DSP (plain C++, no framework)
-Source/PluginProcessor.*      parameters, presets, state, latency reporting
-Source/PluginEditor.*         the plugin window
-tests/render_demo.cpp         renders a before/after demo with a synthetic guitar
-tests/host/                   loads the built VST3 like a DAW and checks it
+TwelveStringEngine.h          all of the DSP (plain C++, no framework)
+PluginProcessor.*             parameters, presets, state, latency reporting
+PluginEditor.*                the plugin window
 .github/workflows/build.yml   cloud build for Windows and macOS
 ```
 

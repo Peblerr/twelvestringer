@@ -38,6 +38,9 @@ TwelveLookAndFeel::TwelveLookAndFeel()
     setColour (juce::TextEditor::textColourId, Palette::text);
     setColour (juce::TextEditor::highlightColourId, Palette::octave.withAlpha (0.4f));
     setColour (juce::CaretComponent::caretColourId, Palette::text);
+    setColour (juce::TooltipWindow::backgroundColourId, Palette::panel.brighter (0.08f));
+    setColour (juce::TooltipWindow::textColourId, Palette::text);
+    setColour (juce::TooltipWindow::outlineColourId, Palette::border);
 }
 
 void TwelveLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h, float pos,
@@ -140,6 +143,12 @@ TwelveStringerEditor::TwelveStringerEditor (TwelveStringerProcessor& p)
         if (idx >= 0) processor.setCurrentProgram (idx);
     };
     addAndMakeVisible (presetBox);
+
+    strum.slider.setTooltip ("How many milliseconds before your note the octave string is picked, "
+                             "like the thin string on top of each pair on a real 12-string.");
+    focus.slider.setTooltip ("How far up the neck the octave strings reach. "
+                             "The detuned twin strings take over above roughly a third of this.");
+    detune.slider.setTooltip ("How far out of tune the twin strings on the high B and E are. 4-8 cents is realistic.");
 
     liveButton.setTooltip ("Live mode: zero latency for monitoring while you record. "
                            "Turn off for mixing - HQ mode has a cleaner octave and FL Studio compensates its delay.");
@@ -283,10 +292,23 @@ void TwelveStringerEditor::paint (juce::Graphics& g)
         g.drawText (s.caption, (int) r.getX() + 26, (int) r.getY() + 30, 220, 16, juce::Justification::left);
     }
 
-    // ---- status ----
+    // ---- status + credit ----
     g.setColour (Palette::dim);
     g.setFont (uiFont (11.5f));
     g.drawText (statusText, statusArea, juce::Justification::centredLeft);
+
+    const juce::String name ("Peter Eardley");
+    const juce::String lead (juce::CharPointer_UTF8 ("v" JucePlugin_VersionString "  \xc2\xb7  Made by "));
+    const auto nameFont = uiFont (12.5f, true);
+    const auto leadFont = uiFont (11.5f);
+    const int nameW = juce::roundToInt (juce::GlyphArrangement::getStringWidth (nameFont, name)) + 2;
+    auto credit = statusArea;
+    g.setColour (Palette::octave);
+    g.setFont (nameFont);
+    g.drawText (name, credit.removeFromRight (nameW), juce::Justification::centredRight);
+    g.setColour (Palette::dim);
+    g.setFont (leadFont);
+    g.drawText (lead, credit, juce::Justification::centredRight);
 }
 
 void TwelveStringerEditor::resized()

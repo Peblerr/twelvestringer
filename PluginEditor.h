@@ -50,6 +50,7 @@ private:
 
     TwelveStringerProcessor& processor;
     TwelveLookAndFeel lnf;
+    juce::TooltipWindow tooltips { this, 600 };
 
     Knob octave, focus, sparkle, unison, detune, drift, strum, width, dry, output;
     std::array<Section, 3> sections;
